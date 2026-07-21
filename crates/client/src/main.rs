@@ -1,5 +1,13 @@
 //! SSH client binary: load local state and hand off to the UI controller.
 
+// On Windows, release builds use the GUI subsystem so no console window is
+// spawned alongside the Slint window. Debug builds keep the console so logs
+// (tracing/eprintln) stay visible during development.
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(

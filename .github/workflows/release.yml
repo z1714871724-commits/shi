@@ -108,8 +108,31 @@ jobs:
             echo "::warning::x86_64 cross-compile unavailable; shipping aarch64-only build"
           fi
           file stage/ssh-client
-      - name: Package
-        run: tar -C stage -czf ${{ steps.macbin.outputs.name }}.tar.gz .
+      - name: Package (.app bundle - launches as a GUI app, no Terminal)
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          case "$VERSION" in *[0-9].[0-9]*) ;; *) VERSION="0.1.1" ;; esac
+          APP="SSH Client.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp stage/ssh-client "$APP/Contents/MacOS/ssh-client"
+          chmod +x "$APP/Contents/MacOS/ssh-client"
+          printf '%s\n' \
+            '<?xml version="1.0" encoding="UTF-8"?>' \
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+            '<plist version="1.0"><dict>' \
+            '<key>CFBundleName</key><string>SSH Client</string>' \
+            '<key>CFBundleDisplayName</key><string>SSH Client</string>' \
+            '<key>CFBundleIdentifier</key><string>app.zhiyong.ssh-client</string>' \
+            '<key>CFBundleVersion</key><string>1</string>' \
+            "<key>CFBundleShortVersionString</key><string>${VERSION}</string>" \
+            '<key>CFBundlePackageType</key><string>APPL</string>' \
+            '<key>CFBundleExecutable</key><string>ssh-client</string>' \
+            '<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>' \
+            '<key>LSMinimumSystemVersion</key><string>11.0</string>' \
+            '<key>NSHighResolutionCapable</key><true/>' \
+            '<key>NSSupportsAutomaticGraphicsSwitching</key><true/>' \
+            '</dict></plist>' > "$APP/Contents/Info.plist"
+          tar czf ${{ steps.macbin.outputs.name }}.tar.gz "$APP"
       - uses: actions/upload-artifact@v4
         with:
           name: ssh-client-macos
