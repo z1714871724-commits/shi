@@ -1,0 +1,34 @@
+[package]
+name = "client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ssh-client"
+path = "src/main.rs"
+
+[dependencies]
+protocol = { workspace = true }
+slint = { version = "=1.16.1" }
+russh = "0.45"
+async-trait = "0.1"
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dirs = "5"
+
+[build-dependencies]
+slint-build = "=1.16.1"
+
+[dev-dependencies]
+server = { path = "../server" }
+axum = { version = "0.7" }

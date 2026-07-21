@@ -1,0 +1,619 @@
+import { Button, LineEdit, ScrollView, ComboBox, VerticalBox, HorizontalBox, Palette } from "std-widgets.slint";
+
+// ---- Theming: every colour derives from `Theme.dark-mode` so a single toggle
+//      re-skins the whole app (including the terminal and the std-widgets via
+//      Palette.color-scheme). Add a colour by adding an `out property` here. ----
+export global Theme {
+    in-out property <bool> dark-mode: true;
+    out property <bool> dark: dark-mode;
+
+    out property <color> bg:         dark ? #1a1b26 : #eef0f4;
+    out property <color> panel:      dark ? #1f2335 : #ffffff;
+    out property <color> card:       dark ? #24283b : #ffffff;
+    out property <color> card-hover: dark ? #2f354d : #eef1f6;
+    out property <color> control:    dark ? #2a2f44 : #e7eaf0;
+    out property <color> border:     dark ? #2f354d : #e0e3e9;
+    out property <color> accent:     dark ? #7aa2f7 : #2e6fd9;
+    out property <color> on-accent:  #ffffff;
+    out property <color> text:       dark ? #c0caf5 : #1f2330;
+    out property <color> dim:        dark ? #565f89 : #6b7280;
+    out property <color> success:    dark ? #9ece6a : #2f9e44;
+    out property <color> danger:     dark ? #f7768e : #e03131;
+    out property <color> warning:    dark ? #e0af68 : #e8590c;
+    out property <color> term-bg:    dark ? #16161e : #ffffff;
+    out property <color> term-fg:    dark ? #c0caf5 : #1f2330;
+    out property <color> term-border: dark ? #2f354d : #e0e3e9;
+}
+
+// ---- Internationalisation: the UI calls AppI18n.tr("key"); Rust implements
+//      the `t` callback and bumps `version` on language change to force every
+//      binding to re-evaluate. Add a language in crates/client/src/i18n.rs. ----
+export global AppI18n {
+    in-out property <string> locale: "en";
+    in-out property <int> version: 0;
+    pure callback t(string, [string]) -> string;
+
+    public pure function tr(key: string) -> string {
+        return t(key, [version]);
+    }
+}
+
+struct HostRow {
+    id: string,
+    name: string,
+    detail: string,
+    auth: string,
+}
+
+struct TabRow {
+    id: string,
+    label: string,
+    connected: bool,
+}
+
+// Small clickable pill used for the theme / language toggles.
+component Chip inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked();
+    height: 30px;
+    min-width: 40px;
+    border-radius: 8px;
+    background: active ? Theme.accent : Theme.control;
+    border-width: 1px;
+    border-color: Theme.border;
+    animate background { duration: 150ms; }
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        alignment: center;
+        Text {
+            text: root.text;
+            color: active ? Theme.on-accent : Theme.text;
+            font-size: 11px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+    TouchArea {
+        width: parent.width;
+        height: parent.height;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component App inherits Window {
+    title: "SSH Client";
+    preferred-width: 1200px;
+    preferred-height: 780px;
+    background: Theme.bg;
+
+    // Keep the std-widgets (Button/LineEdit/ComboBox) in sync with the theme.
+    // `Palette` is an imported global, so its property cannot be bound
+    // reactively from a component. We expose a public function that Rust calls
+    // right after applying the saved `dark-mode` (startup) and that the theme
+    // toggle calls as well, so std-widgets always track the chosen theme.
+    public function apply-palette() {
+        Palette.color-scheme = Theme.dark ? ColorScheme.dark : ColorScheme.light;
+    }
+
+    in-out property <string> server-url: "http://127.0.0.1:8787";
+    in-out property <string> username;
+    in-out property <string> password;
+    in-out property <string> status;
+    in-out property <int> screen: 0; // 0 = login, 1 = main
+    in-out property <bool> busy;
+    in-out property <bool> connected;
+    in-out property <string> terminal-text;
+    in-out property <string> term-host-label;
+    in-out property <string> terminal-font: "Menlo";
+
+    in-out property <[TabRow]> tabs;
+    in-out property <int> active-tab: -1;
+
+    in-out property <bool> show-login-pw: false;
+    in-out property <bool> show-host-pw: false;
+
+    in-out property <string> editing-id;
+    in-out property <string> hf-name;
+    in-out property <string> hf-host;
+    in-out property <string> hf-port-text: "22";
+    in-out property <string> hf-user;
+    in-out property <string> hf-auth: "password";
+    in-out property <string> hf-password;
+    in-out property <string> hf-keypath;
+    in-out property <string> hf-passphrase;
+
+    in-out property <string> search;
+    in-out property <[HostRow]> host-list;
+
+    callback login-clicked();
+    callback register-clicked();
+    callback logout-clicked();
+    callback add-host-clicked();
+    callback connect-clicked(int);
+    callback edit-host-clicked(int);
+    callback delete-host-clicked(int);
+    callback new-host-clicked();
+    callback sync-clicked();
+    callback search-changed();
+    callback term-key(string, bool, bool, bool);
+    callback send-button(string);
+    callback clear-terminal-clicked();
+    callback select-tab(int);
+    callback close-tab(int);
+    callback font-changed();
+    callback theme-changed();
+    callback toggle-lang();
+
+    // ---------- login screen ----------
+    if screen == 0 : Rectangle {
+        background: Theme.bg;
+        VerticalLayout {
+            // top-right theme / language toggles
+            Rectangle {
+                height: 50px;
+                HorizontalLayout {
+                    alignment: end;
+                    padding-right: 16px;
+                    padding-top: 12px;
+                    spacing: 8px;
+                    Chip {
+                        text: AppI18n.tr(Theme.dark ? "theme.dark" : "theme.light");
+                        clicked => { Theme.dark-mode = !Theme.dark-mode; root.apply-palette(); root.theme-changed(); }
+                    }
+                    Chip {
+                        text: AppI18n.locale == "zh" ? AppI18n.tr("lang.zh") : AppI18n.tr("lang.en");
+                        clicked => { root.toggle-lang(); }
+                    }
+                }
+            }
+            Rectangle {
+                vertical-stretch: 1;
+                HorizontalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 420px;
+                        height: 460px;
+                        background: Theme.panel;
+                        border-radius: 16px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        animate background, border-color { duration: 200ms; }
+                        VerticalBox {
+                            padding: 34px;
+                            spacing: 14px;
+                            Text {
+                                text: AppI18n.tr("app.title");
+                                color: Theme.text;
+                                font-size: 24px;
+                                font-weight: 800;
+                                horizontal-alignment: center;
+                            }
+                            Text {
+                                text: AppI18n.tr("login.subtitle");
+                                color: Theme.dim;
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                            }
+                            Text { text: AppI18n.tr("login.server-url"); color: Theme.dim; font-size: 12px; }
+                            LineEdit { placeholder-text: AppI18n.tr("ph.server-url"); text <=> root.server-url; }
+                            Text { text: AppI18n.tr("login.username"); color: Theme.dim; font-size: 12px; }
+                            LineEdit { placeholder-text: AppI18n.tr("ph.username"); text <=> root.username; }
+                            Text { text: AppI18n.tr("login.password"); color: Theme.dim; font-size: 12px; }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                LineEdit {
+                                    placeholder-text: AppI18n.tr("ph.password");
+                                    text <=> root.password;
+                                    input-type: root.show-login-pw ? InputType.text : InputType.password;
+                                    horizontal-stretch: 1;
+                                }
+                                Button {
+                                    text: root.show-login-pw ? AppI18n.tr("login.hide") : AppI18n.tr("login.show");
+                                    width: 64px;
+                                    clicked => { root.show-login-pw = !root.show-login-pw; }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                padding-top: 6px;
+                                Button {
+                                    text: AppI18n.tr("login.login");
+                                    primary: true;
+                                    enabled: !root.busy;
+                                    horizontal-stretch: 1;
+                                    clicked => { root.login-clicked(); }
+                                }
+                                Button {
+                                    text: AppI18n.tr("login.register");
+                                    enabled: !root.busy;
+                                    horizontal-stretch: 1;
+                                    clicked => { root.register-clicked(); }
+                                }
+                            }
+                            Text {
+                                text: root.status;
+                                color: Theme.danger;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                                horizontal-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------- main screen ----------
+    if screen == 1 : Rectangle {
+        background: Theme.bg;
+        VerticalLayout {
+            spacing: 0px;
+            // top bar
+            Rectangle {
+                height: 48px;
+                background: Theme.panel;
+                border-width: 1px;
+                border-color: Theme.border;
+                animate background { duration: 200ms; }
+                HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 12px;
+                    spacing: 8px;
+                    Text {
+                        text: AppI18n.tr("app.title");
+                        color: Theme.accent;
+                        font-size: 15px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text {
+                        text: AppI18n.tr("main.signed-in") + root.username;
+                        color: Theme.dim;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+                    Chip {
+                        text: AppI18n.tr(Theme.dark ? "theme.dark" : "theme.light");
+                        clicked => { Theme.dark-mode = !Theme.dark-mode; root.apply-palette(); root.theme-changed(); }
+                    }
+                    Chip {
+                        text: AppI18n.locale == "zh" ? AppI18n.tr("lang.zh") : AppI18n.tr("lang.en");
+                        clicked => { root.toggle-lang(); }
+                    }
+                    Button { text: AppI18n.tr("main.sync"); primary: true; enabled: !root.busy; clicked => { root.sync-clicked(); } }
+                    Button { text: AppI18n.tr("main.logout"); clicked => { root.logout-clicked(); } }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 0px;
+                // ---- left sidebar ----
+                Rectangle {
+                    width: 350px;
+                    background: Theme.panel;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    animate background { duration: 200ms; }
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 8px;
+                        LineEdit {
+                            placeholder-text: AppI18n.tr("main.search");
+                            text <=> root.search;
+                            edited => { root.search-changed(); }
+                        }
+                        ScrollView {
+                            vertical-stretch: 1;
+                            VerticalLayout {
+                                spacing: 6px;
+                                for host[i] in root.host-list : Rectangle {
+                                    height: 60px;
+                                    background: host-ta.has-hover ? Theme.card-hover : Theme.card;
+                                    border-radius: 10px;
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+                                    animate background { duration: 120ms; }
+                                    host-ta := TouchArea {
+                                        width: parent.width; height: parent.height;
+                                    }
+                                    HorizontalLayout {
+                                        padding: 10px;
+                                        spacing: 8px;
+                                        VerticalLayout {
+                                            Text {
+                                                text: host.name;
+                                                color: Theme.text;
+                                                font-weight: 600;
+                                                font-size: 13px;
+                                            }
+                                            Text {
+                                                text: host.detail;
+                                                color: Theme.dim;
+                                                font-size: 11px;
+                                            }
+                                        }
+                                        Rectangle { horizontal-stretch: 1; }
+                                        Text {
+                                            text: host.auth;
+                                            color: Theme.accent;
+                                            font-size: 10px;
+                                            vertical-alignment: center;
+                                        }
+                                        Button { text: AppI18n.tr("main.connect"); primary: true; clicked => { root.connect-clicked(i); } }
+                                        Button { text: AppI18n.tr("main.edit"); clicked => { root.edit-host-clicked(i); } }
+                                        Button { text: "x"; width: 34px; clicked => { root.delete-host-clicked(i); } }
+                                    }
+                                }
+                                if root.host-list.length == 0 : Rectangle {
+                                    height: 80px;
+                                    Text {
+                                        text: AppI18n.tr("main.no-hosts");
+                                        color: Theme.dim;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+                        // ---- add / edit host form ----
+                        Rectangle {
+                            background: Theme.card;
+                            border-radius: 10px;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            animate background { duration: 200ms; }
+                            VerticalLayout {
+                                padding: 12px;
+                                spacing: 6px;
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    Text {
+                                        text: root.editing-id == "" ? AppI18n.tr("host.add") : AppI18n.tr("host.edit");
+                                        color: Theme.text;
+                                        font-weight: 700;
+                                        font-size: 13px;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+                                    if root.editing-id != "" : Button {
+                                        text: AppI18n.tr("host.new");
+                                        clicked => { root.new-host-clicked(); }
+                                    }
+                                }
+                                LineEdit { placeholder-text: AppI18n.tr("host.name"); text <=> root.hf-name; }
+                                LineEdit { placeholder-text: AppI18n.tr("host.host"); text <=> root.hf-host; }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    LineEdit { placeholder-text: AppI18n.tr("host.port"); text <=> root.hf-port-text; width: 70px; }
+                                    LineEdit { placeholder-text: AppI18n.tr("host.user"); text <=> root.hf-user; horizontal-stretch: 1; }
+                                }
+                                ComboBox { model: ["password", "key"]; current-value <=> root.hf-auth; }
+                                if root.hf-auth == "password" : HorizontalLayout {
+                                    spacing: 6px;
+                                    LineEdit {
+                                        placeholder-text: AppI18n.tr("host.password");
+                                        text <=> root.hf-password;
+                                        input-type: root.show-host-pw ? InputType.text : InputType.password;
+                                        horizontal-stretch: 1;
+                                    }
+                                    Button {
+                                        text: root.show-host-pw ? AppI18n.tr("login.hide") : AppI18n.tr("login.show");
+                                        width: 56px;
+                                        clicked => { root.show-host-pw = !root.show-host-pw; }
+                                    }
+                                }
+                                if root.hf-auth == "key" : LineEdit {
+                                    placeholder-text: AppI18n.tr("host.key-path");
+                                    text <=> root.hf-keypath;
+                                }
+                                if root.hf-auth == "key" : HorizontalLayout {
+                                    spacing: 6px;
+                                    LineEdit {
+                                        placeholder-text: AppI18n.tr("host.passphrase");
+                                        text <=> root.hf-passphrase;
+                                        input-type: root.show-host-pw ? InputType.text : InputType.password;
+                                        horizontal-stretch: 1;
+                                    }
+                                    Button {
+                                        text: root.show-host-pw ? AppI18n.tr("login.hide") : AppI18n.tr("login.show");
+                                        width: 56px;
+                                        clicked => { root.show-host-pw = !root.show-host-pw; }
+                                    }
+                                }
+                                Button {
+                                    text: root.editing-id == "" ? AppI18n.tr("host.save") : AppI18n.tr("host.update");
+                                    primary: true;
+                                    clicked => { root.add-host-clicked(); }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ---- right terminal panel ----
+                Rectangle {
+                    horizontal-stretch: 1;
+                    background: Theme.dark ? #15171a : #f5f6f8;
+                    animate background { duration: 200ms; }
+                    VerticalLayout {
+                        padding: 0px;
+                        spacing: 0px;
+
+                        // ---- tab bar ----
+                        Rectangle {
+                            height: 36px;
+                            background: Theme.panel;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            animate background { duration: 200ms; }
+                            HorizontalLayout {
+                                padding: 4px;
+                                padding-left: 8px;
+                                spacing: 4px;
+                                alignment: start;
+                                for tab[i] in root.tabs : Rectangle {
+                                    height: 28px;
+                                    width: 200px;
+                                    background: i == root.active-tab ? Theme.card : (tab-ta.has-hover ? Theme.card-hover : transparent);
+                                    border-radius: 6px;
+                                    border-width: 1px;
+                                    border-color: i == root.active-tab ? Theme.border : transparent;
+                                    animate background { duration: 120ms; }
+                                    tab-ta := TouchArea {
+                                        width: parent.width; height: parent.height;
+                                        clicked => { root.select-tab(i); }
+                                    }
+                                    HorizontalLayout {
+                                        padding-left: 10px;
+                                        padding-right: 6px;
+                                        spacing: 6px;
+                                        Rectangle {
+                                            width: 8px; height: 8px;
+                                            y: (parent.height - self.height) / 2;
+                                            background: tab.connected ? Theme.success : Theme.dim;
+                                            border-radius: 4px;
+                                        }
+                                        Text {
+                                            text: tab.label;
+                                            color: i == root.active-tab ? Theme.text : Theme.dim;
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                            overflow: elide;
+                                        }
+                                        close-ta := TouchArea {
+                                            width: 18px; height: 18px;
+                                            y: (parent.height - self.height) / 2;
+                                            clicked => { root.close-tab(i); }
+                                            Rectangle {
+                                                width: 18px; height: 18px;
+                                                background: close-ta.has-hover ? Theme.card-hover : transparent;
+                                                border-radius: 4px;
+                                                Text {
+                                                    text: "x";
+                                                    color: Theme.dim;
+                                                    font-size: 11px;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if root.tabs.length == 0 : Text {
+                                    text: AppI18n.tr("term.no-sessions");
+                                    color: Theme.dim;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        // ---- terminal toolbar ----
+                        Rectangle {
+                            height: 44px;
+                            background: Theme.panel;
+                            animate background { duration: 200ms; }
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 10px;
+                                spacing: 8px;
+                                Rectangle {
+                                    width: 10px; height: 10px;
+                                    y: (parent.height - self.height) / 2;
+                                    background: root.connected ? Theme.success : Theme.danger;
+                                    border-radius: 5px;
+                                }
+                                Text {
+                                    text: root.term-host-label;
+                                    color: Theme.text;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: AppI18n.tr("term.font") + ":";
+                                    color: Theme.dim;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                }
+                                LineEdit {
+                                    placeholder-text: AppI18n.tr("ph.font");
+                                    text <=> root.terminal-font;
+                                    width: 160px;
+                                    font-size: 11px;
+                                    edited => { root.font-changed(); }
+                                }
+                                Button { text: "Ctrl-C"; clicked => { root.send-button("ctrl-c"); } }
+                                Button { text: "Ctrl-D"; clicked => { root.send-button("ctrl-d"); } }
+                                Button { text: "Tab"; clicked => { root.send-button("tab"); } }
+                                Button { text: "Esc"; clicked => { root.send-button("esc"); } }
+                                Button { text: AppI18n.tr("term.clear"); clicked => { root.clear-terminal-clicked(); } }
+                                if root.tabs.length > 0 : Button {
+                                    text: AppI18n.tr("term.disconnect");
+                                    clicked => { root.close-tab(root.active-tab); }
+                                }
+                            }
+                        }
+
+                        // ---- terminal ----
+                        term-focus := FocusScope {
+                            vertical-stretch: 1;
+                            key-pressed(e) => {
+                                root.term-key(e.text, e.modifiers.control, e.modifiers.shift, e.modifiers.alt);
+                                accept
+                            }
+                            term-rect := Rectangle {
+                                background: Theme.term-bg;
+                                border-width: 1px;
+                                border-color: Theme.term-border;
+                                clip: true;
+                                animate background { duration: 200ms; }
+                                sv := ScrollView {
+                                    VerticalBox {
+                                        padding: 10px;
+                                        term-text := Text {
+                                            text: root.terminal-text;
+                                            color: Theme.term-fg;
+                                            font-family: root.terminal-font;
+                                            font-size: 13px;
+                                            wrap: no-wrap;
+                                            animate color { duration: 200ms; }
+                                        }
+                                    }
+                                    // pin to bottom so new output is always visible
+                                    viewport-y: min(0px, self.visible-height - self.viewport-height);
+                                }
+                            }
+                            TouchArea {
+                                width: parent.width; height: parent.height;
+                                clicked => { term-focus.focus(); }
+                            }
+                        }
+
+                        // ---- status bar ----
+                        Rectangle {
+                            height: 24px;
+                            background: Theme.panel;
+                            animate background { duration: 200ms; }
+                            Text {
+                                text: root.status;
+                                color: Theme.dim;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                                x: 12px;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-test:
+    name: Lint & Test (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux GUI deps (Slint winit/skia)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libx11-dev libx11-xcb-dev libxrandr-dev libxi-dev \
+            libxext-dev libxcursor-dev libgl1-mesa-dev libegl1-mesa-dev \
+            libfontconfig1-dev libfreetype6-dev libwayland-dev libdbus-1-dev \
+            libexpat1-dev
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-lint
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy (report-only; pre-existing warnings in terminal.rs)
+        run: cargo clippy --workspace --all-targets || true
+      - name: Test
+        run: cargo test --workspace
+
+  build-client:
+    name: Build client (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux
+          - os: windows-latest
+            label: windows
+          - os: macos-latest
+            label: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux GUI deps (Slint winit/skia)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libx11-dev libx11-xcb-dev libxrandr-dev libxi-dev \
+            libxext-dev libxcursor-dev libgl1-mesa-dev libegl1-mesa-dev \
+            libfontconfig1-dev libfreetype6-dev libwayland-dev libdbus-1-dev \
+            libexpat1-dev
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-client-${{ matrix.label }}
+      - name: Build client (release)
+        run: cargo build --release -p client

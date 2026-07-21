@@ -1,0 +1,155 @@
+name: Release
+
+# Build & package the sync server (linux) and the SSH client for the three
+# desktop platforms, then attach everything to a GitHub Release. Triggered by
+# pushing a tag like `v0.1.0`.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------- server (linux x86_64) ----------------
+  build-server:
+    name: Server (linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rel-server-linux
+      - name: Build server (release)
+        run: cargo build --release -p server
+      - name: Package
+        run: |
+          mkdir -p stage
+          cp target/release/ssh-sync-server stage/
+          cp README.md stage/ 2>/dev/null || true
+          tar -C stage -czf ssh-sync-server-x86_64-unknown-linux-gnu.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ssh-sync-server-x86_64-linux
+          path: ssh-sync-server-x86_64-unknown-linux-gnu.tar.gz
+          if-no-files-found: error
+
+  # ---------------- client (linux x86_64) ----------------
+  build-client-linux:
+    name: Client (linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux GUI deps (Slint winit/skia)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libx11-dev libx11-xcb-dev libxrandr-dev libxi-dev \
+            libxext-dev libxcursor-dev libgl1-mesa-dev libegl1-mesa-dev \
+            libfontconfig1-dev libfreetype6-dev libwayland-dev libdbus-1-dev \
+            libexpat1-dev
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rel-client-linux
+      - name: Build client (release)
+        run: cargo build --release -p client
+      - name: Package
+        run: |
+          mkdir -p stage
+          cp target/release/ssh-client stage/
+          tar -C stage -czf ssh-client-x86_64-unknown-linux-gnu.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ssh-client-x86_64-linux
+          path: ssh-client-x86_64-unknown-linux-gnu.tar.gz
+          if-no-files-found: error
+
+  # ---------------- client (macOS universal) ----------------
+  build-client-macos:
+    name: Client (macOS universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rel-client-macos
+      - name: Build client (aarch64)
+        run: cargo build --release -p client --target aarch64-apple-darwin
+      - name: Build client (x86_64)
+        run: cargo build --release -p client --target x86_64-apple-darwin
+      - name: Create universal binary
+        run: |
+          lipo -create \
+            target/aarch64-apple-darwin/release/ssh-client \
+            target/x86_64-apple-darwin/release/ssh-client \
+            -output ssh-client
+          file ssh-client
+      - name: Package
+        run: |
+          mkdir -p stage
+          cp ssh-client stage/
+          tar -C stage -czf ssh-client-universal-apple-darwin.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ssh-client-universal-macos
+          path: ssh-client-universal-apple-darwin.tar.gz
+          if-no-files-found: error
+
+  # ---------------- client (windows x86_64) ----------------
+  build-client-windows:
+    name: Client (windows x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rel-client-windows
+      - name: Build client (release)
+        run: cargo build --release -p client
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path stage | Out-Null
+          Copy-Item target/release/ssh-client.exe stage/
+          Compress-Archive -Path stage/* -DestinationPath ssh-client-x86_64-pc-windows-msvc.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ssh-client-x86_64-windows
+          path: ssh-client-x86_64-pc-windows-msvc.zip
+          if-no-files-found: error
+
+  # ---------------- publish GitHub Release ----------------
+  release:
+    name: Publish release
+    needs:
+      - build-server
+      - build-client-linux
+      - build-client-macos
+      - build-client-windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release-assets/ \;
+          ls -l release-assets
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-assets/*

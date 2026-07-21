@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Runtime databases (server sqlite)
+*.db
+*.db-shm
+*.db-wal
+
+# Local build outputs
+/outputs
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
