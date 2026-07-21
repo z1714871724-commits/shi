@@ -71,9 +71,12 @@ jobs:
           path: ssh-client-x86_64-unknown-linux-gnu.tar.gz
           if-no-files-found: error
 
-  # ---------------- client (macOS universal) ----------------
+  # ---------------- client (macOS) ----------------
+  # Builds aarch64 natively (required) and attempts an x86_64 cross-compile.
+  # If the cross-compile fails (skia C++ cross-build can be flaky) we fall back
+  # to an aarch64-only build so the release never breaks on macOS.
   build-client-macos:
-    name: Client (macOS universal)
+    name: Client (macOS)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -85,24 +88,32 @@ jobs:
           key: rel-client-macos
       - name: Build client (aarch64)
         run: cargo build --release -p client --target aarch64-apple-darwin
-      - name: Build client (x86_64)
+      - name: Build client (x86_64, cross-compile)
+        id: intel
+        continue-on-error: true
         run: cargo build --release -p client --target x86_64-apple-darwin
-      - name: Create universal binary
-        run: |
-          lipo -create \
-            target/aarch64-apple-darwin/release/ssh-client \
-            target/x86_64-apple-darwin/release/ssh-client \
-            -output ssh-client
-          file ssh-client
-      - name: Package
+      - name: Create universal binary (or fall back to aarch64)
+        id: macbin
         run: |
           mkdir -p stage
-          cp ssh-client stage/
-          tar -C stage -czf ssh-client-universal-apple-darwin.tar.gz .
+          if [ -f target/x86_64-apple-darwin/release/ssh-client ]; then
+            lipo -create \
+              target/aarch64-apple-darwin/release/ssh-client \
+              target/x86_64-apple-darwin/release/ssh-client \
+              -output stage/ssh-client
+            echo "name=ssh-client-universal-apple-darwin" >> "$GITHUB_OUTPUT"
+          else
+            cp target/aarch64-apple-darwin/release/ssh-client stage/ssh-client
+            echo "name=ssh-client-aarch64-apple-darwin" >> "$GITHUB_OUTPUT"
+            echo "::warning::x86_64 cross-compile unavailable; shipping aarch64-only build"
+          fi
+          file stage/ssh-client
+      - name: Package
+        run: tar -C stage -czf ${{ steps.macbin.outputs.name }}.tar.gz .
       - uses: actions/upload-artifact@v4
         with:
-          name: ssh-client-universal-macos
-          path: ssh-client-universal-apple-darwin.tar.gz
+          name: ssh-client-macos
+          path: ${{ steps.macbin.outputs.name }}.tar.gz
           if-no-files-found: error
 
   # ---------------- client (windows x86_64) ----------------
