@@ -151,6 +151,10 @@ it. Synced state on the server is always ciphertext.
   and screen erase, SGR colour stripping, OSC, insert/delete) backed by a
   character grid, so multibyte glyphs (Nerd Font icons, CJK) keep one column.
   It is not a full xterm; some advanced applications may render imperfectly.
+- **Text selection & copy**: drag the mouse over the terminal to select (the
+  highlight tracks the rendered glyphs), then click **Copy** to copy the
+  selection to the system clipboard (or all visible text if nothing is
+  selected). Selecting is cleared automatically when new output arrives.
 - **Terminal font** is configurable from the terminal toolbar (e.g. set it to a
   Nerd Font like `JetBrainsMono Nerd Font` to see prompt icons). The choice is
   saved to local state and persists across launches.

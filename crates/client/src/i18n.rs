@@ -59,6 +59,7 @@ fn en() -> &'static [(&'static str, &'static str)] {
         ("term.font", "Font"),
         ("term.clear", "Clear"),
         ("term.disconnect", "Disconnect"),
+        ("term.copy", "Copy"),
         ("theme.dark", "Dark"),
         ("theme.light", "Light"),
         ("lang.en", "EN"),
@@ -97,6 +98,7 @@ fn en() -> &'static [(&'static str, &'static str)] {
         ("status.adding-host", "adding a new host"),
         ("status.login-failed", "login failed: {0}"),
         ("status.error", "error: {0}"),
+        ("status.copied", "copied {0} chars"),
     ]
 }
 
@@ -135,6 +137,7 @@ fn zh() -> &'static [(&'static str, &'static str)] {
         ("term.font", "字体"),
         ("term.clear", "清屏"),
         ("term.disconnect", "断开"),
+        ("term.copy", "复制"),
         ("theme.dark", "深色"),
         ("theme.light", "浅色"),
         ("lang.en", "EN"),
@@ -169,6 +172,7 @@ fn zh() -> &'static [(&'static str, &'static str)] {
         ("status.adding-host", "正在添加新主机"),
         ("status.login-failed", "登录失败：{0}"),
         ("status.error", "错误：{0}"),
+        ("status.copied", "已复制 {0} 个字符"),
     ]
 }
 

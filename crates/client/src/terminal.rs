@@ -55,6 +55,11 @@ impl TerminalBuffer {
         }
     }
 
+    /// Current grid width in columns.
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
     /// Feed raw bytes from the SSH channel. UTF-8 is decoded incrementally;
     /// a partial multibyte sequence at the end is buffered for the next call.
     pub fn feed(&mut self, data: &[u8]) {

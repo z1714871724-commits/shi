@@ -175,7 +175,7 @@ impl AppController {
             ui.set_status(SharedString::default());
             ui.set_connected(false);
             ui.set_term_host_label("not connected".into());
-            ui.set_terminal_text(SharedString::default());
+            set_terminal_text(&ui, SharedString::default());
             refresh_tabs_from(&state.borrow(), &ui);
         });
 
@@ -330,7 +330,7 @@ impl AppController {
                     }
                 }
             }
-            ui.set_terminal_text(SharedString::default());
+            set_terminal_text(&ui, SharedString::default());
         });
 
         let ui = self.ui_weak();
@@ -381,6 +381,46 @@ impl AppController {
             let mut st = state.borrow_mut();
             st.local.lang = new_lang.to_string();
             let _ = st.local.save();
+        });
+
+        let ui = self.ui_weak();
+        let state = self.state.clone();
+        self.ui.on_term_sel_start(move |col: f32, line: f32| {
+            let ui = match ui.upgrade() {
+                Some(u) => u,
+                None => return,
+            };
+            let col = col.floor() as i32;
+            let line = line.floor() as i32;
+            ui.set_sel_start_line(line);
+            ui.set_sel_start_col(col);
+            ui.set_sel_end_line(line);
+            ui.set_sel_end_col(col);
+            recompute_selection(&ui, &state);
+        });
+
+        let ui = self.ui_weak();
+        let state = self.state.clone();
+        self.ui.on_term_sel_move(move |col: f32, line: f32| {
+            let ui = match ui.upgrade() {
+                Some(u) => u,
+                None => return,
+            };
+            if ui.get_sel_start_line() < 0 {
+                return;
+            }
+            ui.set_sel_end_line(line.floor() as i32);
+            ui.set_sel_end_col(col.floor() as i32);
+            recompute_selection(&ui, &state);
+        });
+
+        let ui = self.ui_weak();
+        self.ui.on_copy_selection(move || {
+            let ui = match ui.upgrade() {
+                Some(u) => u,
+                None => return,
+            };
+            handle_copy(&ui);
         });
     }
 
@@ -487,7 +527,7 @@ fn pump(ui: &Weak<crate::App>, state: &Rc<RefCell<UiState>>) {
             ui.set_status(i18n::tr("status.session-ended-label", &[label.to_string()]).into());
         }
         if st.sessions.is_empty() {
-            ui.set_terminal_text(SharedString::default());
+            set_terminal_text(&ui, SharedString::default());
         }
     }
 
@@ -497,7 +537,7 @@ fn pump(ui: &Weak<crate::App>, state: &Rc<RefCell<UiState>>) {
             if s.dirty {
                 s.dirty = false;
                 let text = s.buffer.borrow().render();
-                ui.set_terminal_text(text.into());
+                set_terminal_text(&ui, text.into());
             }
         }
     }
@@ -511,12 +551,12 @@ fn pump(ui: &Weak<crate::App>, state: &Rc<RefCell<UiState>>) {
                 ui.set_connected(s.connected);
                 ui.set_term_host_label(s.label.clone().into());
                 let text = s.buffer.borrow().render();
-                ui.set_terminal_text(text.into());
+                set_terminal_text(&ui, text.into());
             }
         } else {
             ui.set_connected(false);
             ui.set_term_host_label("not connected".into());
-            ui.set_terminal_text(SharedString::default());
+            set_terminal_text(&ui, SharedString::default());
         }
     }
 }
@@ -898,7 +938,7 @@ fn handle_connect(ui: &Weak<crate::App>, state: &Rc<RefCell<UiState>>, index: us
     st.tabs_dirty = true;
     drop(st);
 
-    ui.set_terminal_text(SharedString::default());
+    set_terminal_text(&ui, SharedString::default());
     ui.set_term_host_label(label.into());
     ui.set_connected(false);
     ui.set_status(
@@ -1005,6 +1045,105 @@ fn pty_size_from_window(win: &slint::Window) -> (u32, u32) {
     // top bar (46) + tab bar (36) + toolbar (42) + status bar (22) + padding (20)
     let term_h = (logical_h - 46.0 - 36.0 - 42.0 - 22.0 - 20.0).max(160.0);
     compute_pty_size(term_w, term_h)
+}
+
+/// Set the terminal text and keep the line-count + selection state in sync.
+/// New output invalidates any active selection, so it is cleared here.
+fn set_terminal_text(ui: &crate::App, text: SharedString) {
+    let lines = if text.is_empty() {
+        0
+    } else {
+        text.matches('\n').count() + 1
+    };
+    ui.set_terminal_text(text);
+    ui.set_term_line_count(lines as i32);
+    ui.set_sel_start_line(-1);
+    ui.set_sel_start_col(-1);
+    ui.set_sel_end_line(-1);
+    ui.set_sel_end_col(-1);
+    ui.set_term_sel_lines(ModelRc::new(VecModel::from(Vec::<crate::SelLine>::new())));
+    ui.set_term_sel_text(SharedString::default());
+}
+
+/// Grid columns of the active session (used for full-width selection bars).
+fn active_cols(state: &Rc<RefCell<UiState>>) -> i32 {
+    let st = state.borrow();
+    (match st.active {
+        Some(i) => st
+            .sessions
+            .get(i)
+            .map(|s| s.buffer.borrow().cols())
+            .unwrap_or(80),
+        None => 80,
+    }) as i32
+}
+
+/// Recompute the selection highlight rects and the selected text from the
+/// `sel-start-*` / `sel-end-*` properties and the rendered terminal text.
+fn recompute_selection(ui: &crate::App, state: &Rc<RefCell<UiState>>) {
+    let (sl, sc, el, ec) = (
+        ui.get_sel_start_line(),
+        ui.get_sel_start_col(),
+        ui.get_sel_end_line(),
+        ui.get_sel_end_col(),
+    );
+    if sl < 0 || el < 0 {
+        return;
+    }
+    let text = ui.get_terminal_text().to_string();
+    if text.is_empty() {
+        return;
+    }
+    let lines: Vec<&str> = text.split('\n').collect();
+    let nlines = lines.len() as i32;
+    if nlines == 0 {
+        return;
+    }
+    let cols = active_cols(state);
+    let (mut sline, mut scol) = (sl, sc);
+    let (mut eline, mut ecol) = (el, ec);
+    if (sline, scol) > (eline, ecol) {
+        std::mem::swap(&mut sline, &mut eline);
+        std::mem::swap(&mut scol, &mut ecol);
+    }
+    sline = sline.clamp(0, nlines - 1);
+    eline = eline.clamp(0, nlines - 1);
+    let mut sel_lines = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
+    for line in sline..=eline {
+        let cs = if line == sline { scol } else { 0 };
+        let ce = if line == eline { ecol } else { cols };
+        sel_lines.push(crate::SelLine {
+            line,
+            col_start: cs,
+            col_end: ce,
+        });
+        let row: Vec<char> = lines[line as usize].chars().collect();
+        let from = (cs as usize).min(row.len());
+        let to = (ce as usize).min(row.len()).max(from);
+        parts.push(row[from..to].iter().collect());
+    }
+    ui.set_term_sel_lines(ModelRc::new(VecModel::from(sel_lines)));
+    ui.set_term_sel_text(parts.join("\n").into());
+}
+
+/// Copy the current selection (or the whole terminal if nothing is selected)
+/// to the system clipboard via the cross-platform `arboard` crate.
+fn handle_copy(ui: &crate::App) {
+    let sel = ui.get_term_sel_text().to_string();
+    let text = if sel.is_empty() {
+        ui.get_terminal_text().to_string()
+    } else {
+        sel
+    };
+    if text.is_empty() {
+        return;
+    }
+    let n = text.chars().count();
+    match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+        Ok(_) => ui.set_status(i18n::tr("status.copied", &[n.to_string()]).into()),
+        Err(e) => ui.set_status(i18n::tr("status.error", &[format!("copy failed: {e}")]).into()),
+    }
 }
 
 /// Translate a Slint key event into the bytes to send to the remote PTY.

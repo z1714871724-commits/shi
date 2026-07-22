@@ -23,6 +23,7 @@ export global Theme {
     out property <color> term-bg:    dark ? #16161e : #ffffff;
     out property <color> term-fg:    dark ? #c0caf5 : #1f2330;
     out property <color> term-border: dark ? #2f354d : #e0e3e9;
+    out property <color> sel: dark ? #7aa2f755 : #2e6fd933;
 }
 
 // ---- Internationalisation: the UI calls AppI18n.tr("key"); Rust implements
@@ -49,6 +50,13 @@ struct TabRow {
     id: string,
     label: string,
     connected: bool,
+}
+
+// One highlighted line of the terminal selection (grid coordinates).
+struct SelLine {
+    line: int,
+    col-start: int,
+    col-end: int,
 }
 
 // Small clickable pill used for the theme / language toggles.
@@ -108,6 +116,15 @@ export component App inherits Window {
     in-out property <string> term-host-label;
     in-out property <string> terminal-font: "Menlo";
 
+    // terminal selection state (grid line/col, -1 = none)
+    in-out property <int> term-line-count: 0;
+    in-out property <[SelLine]> term-sel-lines;
+    in-out property <string> term-sel-text;
+    in-out property <int> sel-start-line: -1;
+    in-out property <int> sel-start-col: -1;
+    in-out property <int> sel-end-line: -1;
+    in-out property <int> sel-end-col: -1;
+
     in-out property <[TabRow]> tabs;
     in-out property <int> active-tab: -1;
 
@@ -145,6 +162,9 @@ export component App inherits Window {
     callback font-changed();
     callback theme-changed();
     callback toggle-lang();
+    callback term-sel-start(float, float);
+    callback term-sel-move(float, float);
+    callback copy-selection();
 
     // ---------- login screen ----------
     if screen == 0 : Rectangle {
@@ -555,6 +575,7 @@ export component App inherits Window {
                                 Button { text: "Ctrl-D"; clicked => { root.send-button("ctrl-d"); } }
                                 Button { text: "Tab"; clicked => { root.send-button("tab"); } }
                                 Button { text: "Esc"; clicked => { root.send-button("esc"); } }
+                                Button { text: AppI18n.tr("term.copy"); clicked => { root.copy-selection(); } }
                                 Button { text: AppI18n.tr("term.clear"); clicked => { root.clear-terminal-clicked(); } }
                                 if root.tabs.length > 0 : Button {
                                     text: AppI18n.tr("term.disconnect");
@@ -576,10 +597,23 @@ export component App inherits Window {
                                 border-color: Theme.term-border;
                                 clip: true;
                                 animate background { duration: 200ms; }
+                                // measured per-line height so selection rects align
+                                // with the rendered glyphs instead of a hardcoded value.
+                                property <length> line-h: term-text.height / max(1, root.term-line-count);
                                 sv := ScrollView {
-                                    VerticalBox {
-                                        padding: 10px;
+                                    content := Rectangle {
+                                        width: sv.visible-width;
+                                        height: term-text.height + 20px;
+                                        // selection highlight, painted behind the text
+                                        for sl in root.term-sel-lines : Rectangle {
+                                            x: 10px + sl.col-start * 7.8px;
+                                            y: 10px + sl.line * term-rect.line-h;
+                                            width: (sl.col-end - sl.col-start) * 7.8px;
+                                            height: term-rect.line-h;
+                                            background: Theme.sel;
+                                        }
                                         term-text := Text {
+                                            x: 10px; y: 10px;
                                             text: root.terminal-text;
                                             color: Theme.term-fg;
                                             font-family: root.terminal-font;
@@ -587,14 +621,24 @@ export component App inherits Window {
                                             wrap: no-wrap;
                                             animate color { duration: 200ms; }
                                         }
+                                        sel-ta := TouchArea {
+                                            x: 10px; y: 10px;
+                                            width: parent.width - 20px;
+                                            height: parent.height - 20px;
+                                            pointer-event(pe) => {
+                                                if pe.kind == PointerEventKind.down && pe.button == PointerEventButton.left {
+                                                    term-focus.focus();
+                                                    root.term-sel-start(self.mouse-x / 7.8px, self.mouse-y / term-rect.line-h);
+                                                }
+                                                if pe.kind == PointerEventKind.move && self.pressed {
+                                                    root.term-sel-move(self.mouse-x / 7.8px, self.mouse-y / term-rect.line-h);
+                                                }
+                                            }
+                                        }
                                     }
                                     // pin to bottom so new output is always visible
                                     viewport-y: min(0px, self.visible-height - self.viewport-height);
                                 }
-                            }
-                            TouchArea {
-                                width: parent.width; height: parent.height;
-                                clicked => { term-focus.focus(); }
                             }
                         }
 
