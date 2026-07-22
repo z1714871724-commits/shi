@@ -60,6 +60,7 @@ fn en() -> &'static [(&'static str, &'static str)] {
         ("term.clear", "Clear"),
         ("term.disconnect", "Disconnect"),
         ("term.copy", "Copy"),
+        ("term.select-all", "Select all"),
         ("theme.dark", "Dark"),
         ("theme.light", "Light"),
         ("lang.en", "EN"),
@@ -138,6 +139,7 @@ fn zh() -> &'static [(&'static str, &'static str)] {
         ("term.clear", "清屏"),
         ("term.disconnect", "断开"),
         ("term.copy", "复制"),
+        ("term.select-all", "全选"),
         ("theme.dark", "深色"),
         ("theme.light", "浅色"),
         ("lang.en", "EN"),
@@ -226,8 +228,13 @@ pub fn tr(key: &str, args: &[String]) -> String {
 mod tests {
     use super::*;
 
+    // The translation table is a process-global; tests that call `set_lang`
+    // race when run in parallel. This lock serialises them for determinism.
+    static I18N_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn english_is_default_and_complete() {
+        let _g = I18N_LOCK.lock().unwrap();
         set_lang("en");
         assert_eq!(t("app.title"), "SSH Client");
         assert_eq!(t("login.login"), "Login");
@@ -235,6 +242,7 @@ mod tests {
 
     #[test]
     fn chinese_overrides_english() {
+        let _g = I18N_LOCK.lock().unwrap();
         set_lang("zh");
         assert_eq!(t("app.title"), "SSH 客户端");
         assert_eq!(t("term.clear"), "清屏");
@@ -252,6 +260,7 @@ mod tests {
 
     #[test]
     fn tr_substitutes_args() {
+        let _g = I18N_LOCK.lock().unwrap();
         set_lang("en");
         assert_eq!(
             tr(

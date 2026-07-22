@@ -414,13 +414,28 @@ impl AppController {
             recompute_selection(&ui, &state);
         });
 
+       let ui = self.ui_weak();
+       self.ui.on_copy_selection(move || {
+           let ui = match ui.upgrade() {
+               Some(u) => u,
+               None => return,
+           };
+           handle_copy(&ui);
+       });
         let ui = self.ui_weak();
-        self.ui.on_copy_selection(move || {
+        let state = self.state.clone();
+        self.ui.on_select_all_term(move || {
             let ui = match ui.upgrade() {
                 Some(u) => u,
                 None => return,
             };
-            handle_copy(&ui);
+            let lines = ui.get_term_line_count().max(1);
+            let cols = active_cols(&state);
+            ui.set_sel_start_line(0);
+            ui.set_sel_start_col(0);
+            ui.set_sel_end_line(lines - 1);
+            ui.set_sel_end_col(cols);
+            recompute_selection(&ui, &state);
         });
     }
 

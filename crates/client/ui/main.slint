@@ -125,6 +125,11 @@ export component App inherits Window {
     in-out property <int> sel-end-line: -1;
     in-out property <int> sel-end-col: -1;
 
+    // right-click context menu state (coordinates relative to term-rect)
+    in-out property <bool> context-menu-visible: false;
+    in-out property <length> context-menu-x: 0px;
+    in-out property <length> context-menu-y: 0px;
+
     in-out property <[TabRow]> tabs;
     in-out property <int> active-tab: -1;
 
@@ -165,6 +170,7 @@ export component App inherits Window {
     callback term-sel-start(float, float);
     callback term-sel-move(float, float);
     callback copy-selection();
+    callback select-all-term();
 
     // ---------- login screen ----------
     if screen == 0 : Rectangle {
@@ -588,8 +594,22 @@ export component App inherits Window {
                         term-focus := FocusScope {
                             vertical-stretch: 1;
                             key-pressed(e) => {
-                                root.term-key(e.text, e.modifiers.control, e.modifiers.shift, e.modifiers.alt);
-                                accept
+                               // Copy shortcut: Cmd+C (mac) or Ctrl+Shift+C (win/linux).
+                               // Plain Ctrl+C still goes to the shell as SIGINT.
+                               if (e.text == "c" || e.text == "C")
+                                   && (e.modifiers.meta || (e.modifiers.control && e.modifiers.shift)) {
+                                    // only copy when text is selected; with no
+                                    // selection the shortcut is a no-op (it must
+                                    // never dump the whole scrollback or reach the
+                                    // shell as SIGINT).
+                                    if root.sel-start-line >= 0 {
+                                        root.copy-selection();
+                                    }
+                                   accept
+                                } else {
+                                    root.term-key(e.text, e.modifiers.control, e.modifiers.shift, e.modifiers.alt);
+                                    accept
+                                }
                             }
                             term-rect := Rectangle {
                                 background: Theme.term-bg;
@@ -625,19 +645,128 @@ export component App inherits Window {
                                             x: 10px; y: 10px;
                                             width: parent.width - 20px;
                                             height: parent.height - 20px;
-                                            pointer-event(pe) => {
-                                                if pe.kind == PointerEventKind.down && pe.button == PointerEventButton.left {
-                                                    term-focus.focus();
-                                                    root.term-sel-start(self.mouse-x / 7.8px, self.mouse-y / term-rect.line-h);
-                                                }
-                                                if pe.kind == PointerEventKind.move && self.pressed {
-                                                    root.term-sel-move(self.mouse-x / 7.8px, self.mouse-y / term-rect.line-h);
-                                                }
-                                            }
+                                           pointer-event(pe) => {
+                                               if pe.kind == PointerEventKind.down && pe.button == PointerEventButton.left {
+                                                   term-focus.focus();
+                                                   root.term-sel-start(self.mouse-x / 7.8px, self.mouse-y / term-rect.line-h);
+                                               }
+                                               if pe.kind == PointerEventKind.down && pe.button == PointerEventButton.right {
+                                                   // open the custom context menu at the cursor (term-rect coords)
+                                                   root.context-menu-x = 10px + self.mouse-x;
+                                                   root.context-menu-y = 10px + self.mouse-y + sv.viewport-y;
+                                                   root.context-menu-visible = true;
+                                               }
+                                               if pe.kind == PointerEventKind.move && self.pressed {
+                                                   root.term-sel-move(self.mouse-x / 7.8px, self.mouse-y / term-rect.line-h);
+                                               }
+                                           }
                                         }
                                     }
                                     // pin to bottom so new output is always visible
-                                    viewport-y: min(0px, self.visible-height - self.viewport-height);
+                                   viewport-y: min(0px, self.visible-height - self.viewport-height);
+                               }
+                               // right-click context menu (custom; Slint 1.16 has no
+                                // built-in menu widget). A transparent backdrop catches
+                                // outside clicks to dismiss; the panel sits on top of it.
+                                if root.context-menu-visible : TouchArea {
+                                    width: term-rect.width;
+                                    height: term-rect.height;
+                                    clicked => {
+                                        root.context-menu-visible = false;
+                                        term-focus.focus();
+                                    }
+                                    pointer-event(pe) => {
+                                        if pe.kind == PointerEventKind.down && pe.button == PointerEventButton.right {
+                                            root.context-menu-x = self.mouse-x;
+                                            root.context-menu-y = self.mouse-y;
+                                        }
+                                    }
+                                }
+                                if root.context-menu-visible : Rectangle {
+                                    property <length> mw: 184px;
+                                    property <length> mh: 108px;
+                                    x: clamp(root.context-menu-x, 0px, term-rect.width - self.mw);
+                                    y: clamp(root.context-menu-y, 0px, term-rect.height - self.mh);
+                                    width: self.mw;
+                                    height: self.mh;
+                                    background: Theme.panel;
+                                    border-radius: 8px;
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+                                    animate background { duration: 150ms; }
+
+                                    mi-copy := Rectangle {
+                                        y: 4px;
+                                        height: 30px;
+                                        width: parent.width;
+                                        background: mi-copy-ta.has-hover ? Theme.card-hover : transparent;
+                                        mi-copy-ta := TouchArea {
+                                            clicked => {
+                                                root.context-menu-visible = false;
+                                                root.copy-selection();
+                                                term-focus.focus();
+                                            }
+                                        }
+                                        Text {
+                                            text: AppI18n.tr("term.copy");
+                                            color: Theme.text;
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                            x: 12px;
+                                        }
+                                    }
+                                    mi-sel := Rectangle {
+                                        y: 34px;
+                                        height: 30px;
+                                        width: parent.width;
+                                        background: mi-sel-ta.has-hover ? Theme.card-hover : transparent;
+                                        mi-sel-ta := TouchArea {
+                                            clicked => {
+                                                root.context-menu-visible = false;
+                                                root.select-all-term();
+                                                term-focus.focus();
+                                            }
+                                        }
+                                        Text {
+                                            text: AppI18n.tr("term.select-all");
+                                            color: Theme.text;
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                            x: 12px;
+                                        }
+                                    }
+                                    Rectangle {
+                                        y: 67px;
+                                        height: 9px;
+                                        width: parent.width;
+                                        Rectangle {
+                                            y: 4px;
+                                            x: 8px;
+                                            height: 1px;
+                                            width: parent.width - 16px;
+                                            background: Theme.border;
+                                        }
+                                    }
+                                    mi-clear := Rectangle {
+                                        y: 76px;
+                                        height: 30px;
+                                        width: parent.width;
+                                        background: mi-clear-ta.has-hover ? Theme.card-hover : transparent;
+                                        mi-clear-ta := TouchArea {
+                                            clicked => {
+                                                root.context-menu-visible = false;
+                                                root.clear-terminal-clicked();
+                                                term-focus.focus();
+                                            }
+                                        }
+                                        Text {
+                                            text: AppI18n.tr("term.clear");
+                                            color: Theme.text;
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                            x: 12px;
+                                        }
+                                    }
                                 }
                             }
                         }
