@@ -38,12 +38,15 @@ struct ActiveSession {
     label: String,
     buffer: Rc<RefCell<TerminalBuffer>>,
     input_tx: mpsc::UnboundedSender<Vec<u8>>,
+    resize_tx: mpsc::UnboundedSender<(u32, u32)>,
     output_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     status_rx: mpsc::UnboundedReceiver<SessionEvent>,
     task: tokio::task::JoinHandle<()>,
     connected: bool,
     ended_msg: Option<String>,
     dirty: bool,
+    /// Last PTY size sent to the remote shell, so we only resend on change.
+    pty_size: Option<(u32, u32)>,
 }
 
 impl Drop for ActiveSession {
@@ -433,9 +436,36 @@ impl AppController {
             let cols = active_cols(&state);
             ui.set_sel_start_line(0);
             ui.set_sel_start_col(0);
-            ui.set_sel_end_line(lines - 1);
-            ui.set_sel_end_col(cols);
-            recompute_selection(&ui, &state);
+           ui.set_sel_end_line(lines - 1);
+           ui.set_sel_end_col(cols);
+           recompute_selection(&ui, &state);
+       });
+        let state = self.state.clone();
+        self.ui.on_paste(move || {
+            // Read the system clipboard and feed it to the active session's
+            // PTY as raw bytes (CR-terminated lines, like a real terminal).
+           let text = match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+               Ok(t) => t,
+               Err(e) => {
+                   tracing::warn!("clipboard read failed: {e}");
+                   return;
+               }
+           };
+            if text.is_empty() {
+                return;
+            }
+            // Normalise CRLF/LF to CR (the PTY line ending) before sending.
+            let bytes: Vec<u8> = text
+                .replace("\r\n", "\n")
+                .replace('\r', "\n")
+               .replace('\n', "\r")
+               .into_bytes();
+            let st = state.borrow();
+           if let Some(i) = st.active {
+               if let Some(s) = st.sessions.get(i) {
+                   let _ = s.input_tx.send(bytes);
+               }
+           }
         });
     }
 
@@ -547,6 +577,23 @@ fn pump(ui: &Weak<crate::App>, state: &Rc<RefCell<UiState>>) {
     }
 
     // Re-render the active session's buffer when it changed.
+    // Keep every connected session's PTY size in sync with the live terminal
+    // widget: recompute the desired size from the actual term-rect geometry +
+    // measured line height, and when it changes resize the local buffer and
+    // notify the remote shell via window-change. This is naturally throttled
+    // (a resend only happens when the computed size actually differs).
+    let desired = pty_size_from_ui(&ui);
+    for s in st.sessions.iter_mut() {
+        if s.connected && s.pty_size != Some(desired) {
+            s.buffer
+                .borrow_mut()
+                .resize(desired.0 as usize, desired.1 as usize);
+            let _ = s.resize_tx.send(desired);
+            s.pty_size = Some(desired);
+            s.dirty = true;
+        }
+    }
+
     if let Some(i) = st.active {
         if let Some(s) = st.sessions.get_mut(i) {
             if s.dirty {
@@ -915,9 +962,9 @@ fn handle_connect(ui: &Weak<crate::App>, state: &Rc<RefCell<UiState>>, index: us
             "{} · {}@{}:{}",
             host.name, host.username, host.host, host.port
         );
-        (host, passphrase, label)
-    };
-    let (cols, rows) = pty_size_from_window(&ui.window());
+       (host, passphrase, label)
+   };
+    let (cols, rows) = pty_size_from_ui(&ui);
 
     let mut st = state.borrow_mut();
     let buffer = Rc::new(RefCell::new(TerminalBuffer::new(
@@ -925,6 +972,7 @@ fn handle_connect(ui: &Weak<crate::App>, state: &Rc<RefCell<UiState>>, index: us
         rows as usize,
     )));
     let (input_tx, input_rx) = mpsc::unbounded_channel();
+    let (resize_tx, resize_rx) = mpsc::unbounded_channel::<(u32, u32)>();
     let (output_tx, output_rx) = mpsc::unbounded_channel();
     let (status_tx, status_rx) = mpsc::unbounded_channel();
     let task = st.runtime.spawn(ssh::run_session(
@@ -933,6 +981,7 @@ fn handle_connect(ui: &Weak<crate::App>, state: &Rc<RefCell<UiState>>, index: us
         cols,
         rows,
         input_rx,
+        resize_rx,
         output_tx,
         status_tx,
     ));
@@ -941,12 +990,14 @@ fn handle_connect(ui: &Weak<crate::App>, state: &Rc<RefCell<UiState>>, index: us
         label: label.clone(),
         buffer,
         input_tx,
+        resize_tx,
         output_rx,
         status_rx,
         task,
         connected: false,
         ended_msg: None,
         dirty: false,
+        pty_size: Some((cols, rows)),
     };
     st.sessions.push(session);
     st.active = Some(st.sessions.len() - 1);
@@ -1060,6 +1111,30 @@ fn pty_size_from_window(win: &slint::Window) -> (u32, u32) {
     // top bar (46) + tab bar (36) + toolbar (42) + status bar (22) + padding (20)
     let term_h = (logical_h - 46.0 - 36.0 - 42.0 - 22.0 - 20.0).max(160.0);
     compute_pty_size(term_w, term_h)
+}
+
+/// Derive the PTY size from the *actual* terminal widget geometry and the
+/// measured per-line height, so the remote shell's screen matches the visible
+/// area exactly. Falls back to the window-based estimate before the widget has
+/// been laid out (sizes == 0).
+fn pty_size_from_ui(ui: &crate::App) -> (u32, u32) {
+    const CHAR_W: f32 = 7.8;
+    const FALLBACK_LINE_H: f32 = 16.0;
+    let area_w = ui.get_term_area_w();
+    let area_h = ui.get_term_area_h();
+    if area_w < 10.0 || area_h < 10.0 {
+        return pty_size_from_window(&ui.window());
+    }
+    let line_h = {
+        let lh = ui.get_term_line_h();
+        if lh > 1.0 { lh } else { FALLBACK_LINE_H }
+    };
+    // 10px inner padding on each side + 1px border
+    let usable_w = (area_w - 22.0).max(80.0);
+    let usable_h = (area_h - 22.0).max(60.0);
+    let cols = ((usable_w / CHAR_W) as u32).clamp(20, 400);
+    let rows = ((usable_h / line_h) as u32).clamp(8, 120);
+    (cols, rows)
 }
 
 /// Set the terminal text and keep the line-count + selection state in sync.

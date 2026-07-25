@@ -16,6 +16,8 @@ pub struct TerminalBuffer {
     state: State,
     params: String,
     osc_buf: String,
+    height: usize,
+    scrollback: Vec<Vec<char>>,
     pending: Vec<u8>, // incomplete UTF-8 carried across feed() calls
 }
 
@@ -30,12 +32,14 @@ enum State {
 
 impl TerminalBuffer {
     pub fn new(cols: usize, rows: usize) -> Self {
-        let rows_init = rows.max(1);
+       let rows_init = rows.max(1);
         let mut buf = Self {
-            rows: (0..rows_init).map(|_| Vec::new()).collect(),
+           rows: (0..rows_init).map(|_| Vec::new()).collect(),
             cur_row: 0,
             cur_col: 0,
             cols,
+            height: rows_init,
+            scrollback: Vec::new(),
             state: State::Ground,
             params: String::new(),
             osc_buf: String::new(),
@@ -45,14 +49,27 @@ impl TerminalBuffer {
         buf
     }
 
+
     pub fn resize(&mut self, cols: usize, rows: usize) {
         self.cols = cols.max(1);
-        while self.rows.len() < rows.max(1) {
+        let new_height = rows.max(1);
+        // The visible screen is exactly `height` rows. When the size changes,
+        // overflow rows scroll off into the scrollback and missing rows are
+        // padded with blanks so the screen always has `height` entries.
+        while self.rows.len() > new_height {
+            self.scrollback.push(self.rows.remove(0));
+            if self.cur_row > 0 {
+                self.cur_row -= 1;
+            }
+        }
+        while self.rows.len() < new_height {
             self.rows.push(Vec::new());
         }
-        if self.cur_row >= self.rows.len() {
-            self.cur_row = self.rows.len() - 1;
+        self.height = new_height;
+        if self.cur_row >= self.height {
+            self.cur_row = self.height - 1;
         }
+        self.cap_total();
     }
 
     /// Current grid width in columns.
@@ -224,6 +241,9 @@ impl TerminalBuffer {
     }
 
     fn ensure_row(&mut self, idx: usize) {
+        // The screen always holds exactly `height` rows; clamp the index so a
+        // stray cursor move can never grow the screen beyond its bounds.
+        let idx = idx.min(self.height.saturating_sub(1));
         while self.rows.len() <= idx {
             self.rows.push(Vec::new());
         }
@@ -258,15 +278,24 @@ impl TerminalBuffer {
     }
 
     fn line_feed(&mut self) {
-        self.cur_row += 1;
-        self.ensure_row(self.cur_row);
-        self.trim_rows();
+        if self.cur_row + 1 >= self.height {
+            // past the last screen row: scroll up (top row -> scrollback) and
+            // keep the cursor on the bottom row, exactly like a real terminal.
+            self.scrollback.push(self.rows.remove(0));
+            self.rows.push(Vec::new());
+            self.cur_row = self.height - 1;
+            self.cap_total();
+        } else {
+            self.cur_row += 1;
+            self.ensure_row(self.cur_row);
+        }
     }
 
     fn reverse_index(&mut self) {
         if self.cur_row == 0 {
+            // scroll down: drop the bottom row, insert a blank at the top
+            self.rows.pop();
             self.rows.insert(0, Vec::new());
-            self.trim_rows();
         } else {
             self.cur_row -= 1;
         }
@@ -276,7 +305,7 @@ impl TerminalBuffer {
         let new_col = (self.cur_col as i64 + dcol).max(0) as usize;
         let new_row = (self.cur_row as i64 + drow).max(0) as usize;
         self.cur_col = new_col.min(self.cols.saturating_sub(1).max(0));
-        self.cur_row = new_row;
+        self.cur_row = new_row.min(self.height.saturating_sub(1));
         self.ensure_row(self.cur_row);
     }
 
@@ -287,7 +316,9 @@ impl TerminalBuffer {
     }
 
     fn set_row(&mut self, row: i64) {
-        self.cur_row = (row as usize).saturating_sub(1);
+        self.cur_row = (row as usize)
+            .saturating_sub(1)
+            .min(self.height.saturating_sub(1));
         self.ensure_row(self.cur_row);
     }
 
@@ -363,7 +394,10 @@ impl TerminalBuffer {
         for _ in 0..n {
             self.rows.insert(self.cur_row, Vec::new());
         }
-        self.trim_rows();
+        // keep the screen at `height` rows; lines pushed past the bottom drop off
+        while self.rows.len() > self.height {
+            self.rows.pop();
+        }
     }
 
     fn delete_lines(&mut self, n: usize) {
@@ -374,20 +408,31 @@ impl TerminalBuffer {
                 self.rows.remove(self.cur_row);
             }
         }
+        // restore the screen height with blank rows at the bottom
+        while self.rows.len() < self.height {
+            self.rows.push(Vec::new());
+        }
         self.ensure_row(self.cur_row);
     }
 
     fn trim_rows(&mut self) {
-        while self.rows.len() > MAX_ROWS {
-            self.rows.remove(0);
-            if self.cur_row > 0 {
-                self.cur_row -= 1;
-            }
+        // kept for API stability; capping now happens in `cap_total`.
+        self.cap_total();
+    }
+
+    /// Cap the combined scrollback + screen to `MAX_ROWS`, dropping the oldest
+    /// scrollback rows. The screen itself is always `height` rows, so only the
+    /// scrollback ever needs trimming.
+    fn cap_total(&mut self) {
+        if self.scrollback.len() > MAX_ROWS {
+            let drop = self.scrollback.len() - MAX_ROWS;
+            self.scrollback.drain(..drop);
         }
     }
 
     pub fn reset(&mut self) {
-        self.rows = vec![Vec::new()];
+        self.rows = (0..self.height).map(|_| Vec::new()).collect();
+        self.scrollback.clear();
         self.cur_row = 0;
         self.cur_col = 0;
     }
@@ -396,17 +441,35 @@ impl TerminalBuffer {
     /// whitespace per line and dropping trailing blank lines. Capped to the
     /// last `max_rows` lines to keep the Slint `Text` cheap to update.
     pub fn render(&self) -> String {
-        let mut end = self.rows.len();
-        while end > 0 && self.rows[end - 1].iter().all(|&c| c == ' ') {
+        // The rendered text is the scrollback followed by the current screen,
+        // with trailing blank lines trimmed so the bottom pins to real content.
+        let total = self.scrollback.len() + self.rows.len();
+        let mut end = total;
+       let is_blank = |abs: usize| -> bool {
+           if abs < self.scrollback.len() {
+               self.scrollback[abs].iter().all(|&c| c == ' ')
+           } else {
+               self.rows[abs - self.scrollback.len()].iter().all(|&c| c == ' ')
+           }
+       };
+        // Trim trailing blank lines (whether in scrollback or on the visible
+        // screen) so the bottom of the rendered text is always real content;
+        // the ScrollView then pins that content to the visible bottom.
+        while end > 0 && is_blank(end - 1) {
             end -= 1;
         }
         let cap = 1500;
         let start = end.saturating_sub(cap);
         let mut out = String::with_capacity((end - start) * (self.cols + 1));
-        for (i, row) in self.rows[start..end].iter().enumerate() {
+        for i in start..end {
+            let row: &Vec<char> = if i < self.scrollback.len() {
+                &self.scrollback[i]
+            } else {
+                &self.rows[i - self.scrollback.len()]
+            };
             let s: String = row.iter().collect();
             out.push_str(s.trim_end());
-            if i + 1 < (end - start) {
+            if i + 1 < end {
                 out.push('\n');
             }
         }
@@ -507,7 +570,55 @@ mod right_prompt_tests {
         t.feed(b"Z");
         let r = t.render();
         assert!(r.lines().count() <= 1, "unexpected wrap: {r:?}");
-        assert!(r.starts_with("ab"), "left text lost: {r:?}");
-        assert!(r.contains('Z'), "right char lost: {r:?}");
+       assert!(r.starts_with("ab"), "left text lost: {r:?}");
+       assert!(r.contains('Z'), "right char lost: {r:?}");
+   }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+
+    /// When the cursor line-feeds past the last screen row the top row must
+    /// scroll into the scrollback instead of the screen growing unboundedly.
+    /// This keeps the shell's screen model in sync with the buffer.
+   #[test]
+  fn scrolls_at_bottom_instead_of_growing() {
+      let mut t = TerminalBuffer::new(10, 3);
+      t.feed(b"line1\r\nline2\r\nline3\r\nline4");
+      // screen holds the last 3 lines; line1 scrolled into the scrollback
+       let rendered = t.render();
+       let lines: Vec<&str> = rendered.lines().collect();
+       // scrollback holds line1; the visible screen is the last 3 rows
+       assert_eq!(lines.len(), 4, "scrollback(1)+screen(3): {lines:?}");
+       assert_eq!(
+           &lines[1..],
+           &["line2", "line3", "line4"],
+           "screen rows wrong: {lines:?}"
+       );
+   }
+}
+
+#[cfg(test)]
+mod cursor_sync_tests {
+    use super::*;
+
+    /// After the screen scrolls, an absolute cursor-position request (CUP to
+    /// row 1) must address the top of the *current screen*, not a row that has
+    /// already scrolled into the scrollback. This is the desync that previously
+    /// made the prompt render in the middle of the terminal.
+    #[test]
+    fn absolute_cursor_targets_current_screen_after_scroll() {
+        let mut t = TerminalBuffer::new(10, 3);
+        t.feed(b"line1\r\nline2\r\nline3\r\nline4");
+        // move to row 1, col 1 (top of the visible screen) and overwrite
+        t.feed(b"\x1b[1;1HXXXX");
+        let r = t.render();
+        let lines: Vec<&str> = r.lines().collect();
+        // screen is the last 3 rows; line1 is in the scrollback (row 0)
+        assert_eq!(lines[0], "line1", "scrollback row wrong: {r:?}");
+        assert!(lines[1].starts_with("XXXX"), "cup hit wrong row: {r:?}");
+        assert_eq!(lines[2], "line3", "screen row 2 wrong: {r:?}");
+        assert_eq!(lines[3], "line4", "screen row 3 wrong: {r:?}");
     }
 }
