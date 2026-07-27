@@ -437,39 +437,22 @@ impl TerminalBuffer {
         self.cur_col = 0;
     }
 
-    /// Render the visible buffer as a UTF-8 string, trimming trailing
-    /// whitespace per line and dropping trailing blank lines. Capped to the
-    /// last `max_rows` lines to keep the Slint `Text` cheap to update.
+    /// Render the current screen as a UTF-8 string: exactly `height` rows,
+    /// top to bottom, with per-line trailing whitespace trimmed. Trailing
+    /// blank rows are preserved so the remote shell's absolute row
+    /// coordinates (1..=height) map 1:1 to visual rows - this is what keeps
+    /// cursor movement, line editing, tab completion and TUIs aligned.
+    /// Scrollback is retained internally for a future scroll-up view but is
+    /// not part of the live render, which always mirrors the fixed screen the
+    /// shell thinks it is drawing on.
     pub fn render(&self) -> String {
-        // The rendered text is the scrollback followed by the current screen,
-        // with trailing blank lines trimmed so the bottom pins to real content.
-        let total = self.scrollback.len() + self.rows.len();
-        let mut end = total;
-       let is_blank = |abs: usize| -> bool {
-           if abs < self.scrollback.len() {
-               self.scrollback[abs].iter().all(|&c| c == ' ')
-           } else {
-               self.rows[abs - self.scrollback.len()].iter().all(|&c| c == ' ')
-           }
-       };
-        // Trim trailing blank lines (whether in scrollback or on the visible
-        // screen) so the bottom of the rendered text is always real content;
-        // the ScrollView then pins that content to the visible bottom.
-        while end > 0 && is_blank(end - 1) {
-            end -= 1;
-        }
-        let cap = 1500;
-        let start = end.saturating_sub(cap);
-        let mut out = String::with_capacity((end - start) * (self.cols + 1));
-        for i in start..end {
-            let row: &Vec<char> = if i < self.scrollback.len() {
-                &self.scrollback[i]
-            } else {
-                &self.rows[i - self.scrollback.len()]
-            };
-            let s: String = row.iter().collect();
-            out.push_str(s.trim_end());
-            if i + 1 < end {
+        let mut out = String::with_capacity(self.height * (self.cols + 1));
+        for i in 0..self.height {
+            if i < self.rows.len() {
+                let s: String = self.rows[i].iter().collect();
+                out.push_str(s.trim_end());
+            }
+            if i + 1 < self.height {
                 out.push('\n');
             }
         }
@@ -500,28 +483,32 @@ mod tests {
         let mut t = TerminalBuffer::new(20, 2);
         // a Nerd Font private-use glyph (3 bytes) followed by text
         t.feed("❯ hostname\r\n".as_bytes());
-        assert_eq!(t.render(), "❯ hostname");
+        // render() is the fixed 2-row screen: row 0 holds the prompt, row 1 is
+        // blank, so a trailing newline separates them.
+        assert_eq!(t.render(), "❯ hostname\n");
     }
 
     #[test]
     fn strips_color_codes() {
         let mut t = TerminalBuffer::new(40, 2);
         t.feed(b"\x1b[31mred\x1b[0m text");
-        assert_eq!(t.render(), "red text");
+        assert_eq!(t.render(), "red text\n");
     }
 
     #[test]
     fn handles_crlf() {
         let mut t = TerminalBuffer::new(40, 4);
         t.feed(b"a\r\nb\r\nc");
-        assert_eq!(t.render(), "a\nb\nc");
+        // 4-row screen: "a","b","c","" -> three newlines join them.
+        assert_eq!(t.render(), "a\nb\nc\n");
     }
 
     #[test]
     fn clear_screen() {
         let mut t = TerminalBuffer::new(40, 4);
         t.feed(b"abc\x1b[2J");
-        assert_eq!(t.render(), "");
+        // a cleared 4-row screen is four blank lines (three newlines).
+        assert_eq!(t.render(), "\n\n\n");
     }
 
     #[test]
@@ -529,9 +516,10 @@ mod tests {
         let mut t = TerminalBuffer::new(20, 2);
         let bytes = "❯".as_bytes(); // 3 bytes
         t.feed(&bytes[..1]); // incomplete
-        assert_eq!(t.render(), "");
+        // nothing written yet: both screen rows are blank.
+        assert_eq!(t.render(), "\n");
         t.feed(&bytes[1..]);
-        assert_eq!(t.render(), "❯");
+        assert_eq!(t.render(), "❯\n");
     }
 }
 
@@ -552,10 +540,11 @@ mod right_prompt_tests {
         // right prompt segment
         t.feed(b"system host 10:51:50");
         let r = t.render();
-        assert!(r.lines().count() <= 1, "right prompt wrapped: {r:?}");
-        assert!(r.contains("~ \u{276f}"), "left prompt missing: {r:?}");
+        // the right prompt must share the first screen row with the left one.
+        let first = r.lines().next().unwrap();
+        assert!(first.contains("~ \u{276f}"), "left prompt missing: {r:?}");
         assert!(
-            r.contains("system host 10:51:50"),
+            first.contains("system host 10:51:50"),
             "right prompt missing: {r:?}"
         );
     }
@@ -569,10 +558,10 @@ mod right_prompt_tests {
         t.feed(b"\x1b[999C"); // jump far right -> clamps to col 39
         t.feed(b"Z");
         let r = t.render();
-        assert!(r.lines().count() <= 1, "unexpected wrap: {r:?}");
-       assert!(r.starts_with("ab"), "left text lost: {r:?}");
-       assert!(r.contains('Z'), "right char lost: {r:?}");
-   }
+        let first = r.lines().next().unwrap();
+        assert!(first.starts_with("ab"), "left text lost: {r:?}");
+        assert!(first.contains('Z'), "right char lost: {r:?}");
+    }
 }
 
 #[cfg(test)]
@@ -582,21 +571,20 @@ mod scroll_tests {
     /// When the cursor line-feeds past the last screen row the top row must
     /// scroll into the scrollback instead of the screen growing unboundedly.
     /// This keeps the shell's screen model in sync with the buffer.
-   #[test]
-  fn scrolls_at_bottom_instead_of_growing() {
-      let mut t = TerminalBuffer::new(10, 3);
-      t.feed(b"line1\r\nline2\r\nline3\r\nline4");
-      // screen holds the last 3 lines; line1 scrolled into the scrollback
-       let rendered = t.render();
-       let lines: Vec<&str> = rendered.lines().collect();
-       // scrollback holds line1; the visible screen is the last 3 rows
-       assert_eq!(lines.len(), 4, "scrollback(1)+screen(3): {lines:?}");
-       assert_eq!(
-           &lines[1..],
-           &["line2", "line3", "line4"],
-           "screen rows wrong: {lines:?}"
-       );
-   }
+    #[test]
+    fn scrolls_at_bottom_instead_of_growing() {
+        let mut t = TerminalBuffer::new(10, 3);
+        t.feed(b"line1\r\nline2\r\nline3\r\nline4");
+        // render() shows the current 3-row screen only; line1 scrolled into
+        // the (internal, not-yet-rendered) scrollback.
+        let rendered = t.render();
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(
+            lines,
+            &["line2", "line3", "line4"],
+            "screen rows wrong: {lines:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -615,10 +603,11 @@ mod cursor_sync_tests {
         t.feed(b"\x1b[1;1HXXXX");
         let r = t.render();
         let lines: Vec<&str> = r.lines().collect();
-        // screen is the last 3 rows; line1 is in the scrollback (row 0)
-        assert_eq!(lines[0], "line1", "scrollback row wrong: {r:?}");
-        assert!(lines[1].starts_with("XXXX"), "cup hit wrong row: {r:?}");
-        assert_eq!(lines[2], "line3", "screen row 2 wrong: {r:?}");
-        assert_eq!(lines[3], "line4", "screen row 3 wrong: {r:?}");
+        // CUP row 1 targets the top of the CURRENT screen (line2's row), so
+        // XXXX overwrites the start of line2; line1 stays in the scrollback.
+        assert_eq!(lines.len(), 3, "screen height: {r:?}");
+        assert!(lines[0].starts_with("XXXX"), "cup hit wrong row: {r:?}");
+        assert_eq!(lines[1], "line3", "screen row 2 wrong: {r:?}");
+        assert_eq!(lines[2], "line4", "screen row 3 wrong: {r:?}");
     }
 }
